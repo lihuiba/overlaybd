@@ -39,33 +39,34 @@ technology. Taken together, they rule out most conventional approaches.
 
 ### Multi-OS support
 
-Filesystem-sharing mechanisms (virtio-fs, 9p, fscache) assume a Linux
+Filesystem-sharing mechanisms (virtio-fs, 9p, fscache, etc.) assume a Linux
 guest with a compatible kernel; they cannot serve a Windows or Android
-guest without a completely different data path. OCI tar layers assume a
-Linux filesystem layout for extraction. overlayfs is a Linux kernel
-feature with no equivalent on other operating systems. Any image format
-that embeds filesystem semantics, requires a specific guest kernel
-module, or assumes Linux-specific infrastructure is disqualified as a
+guest without a completely different data path.
+Any image format that requires a specific guest kernel module or
+assumes Linux-specific serving infrastructure is disqualified as a
 universal substrate from the start.
+
+The service framework of agent sandboxes needs a single stack that
+is independent of and supports all possible guest OSes.
 
 ### VM snapshot: save and cross-machine restore
 
-Agent sandboxes must be snapshotted, forked, and resumed — potentially
-on a different physical host. Because agents explore interactively (fork
-on every speculative branch, rollback on failure, resume in under a
-second), snapshots are not a rare administrative operation but a
-per-action hot path. This requires the storage layer to be stateless
-from the guest's perspective.
+Agent sandboxes are frequently snapshotted, cloned, rolled back, and
+resumed, sometimes on a different physical host — and because agents
+explore interactively (fork on every speculative branch, roll back on
+failure, resume instantly), snapshots are not a rare administrative
+operation but a per-action hot path. The storage layer should thus
+make writable state easy to capture and minimize host-local
+dependencies.
 
-virtio-fs is a stateful protocol: the guest and host share FUSE session
-state, inode mappings, open file descriptors, and lock tables. A VM
-snapshot cannot be restored on a different host because that state lives
-in the original host's virtiofsd process. overlayfs has a similar
-problem: a running sandbox's filesystem state — the overlay mount, its
-upper directory, and kernel-internal mount structures — cannot be
-atomically captured and resumed on another machine. For agent sandboxes
-that must fork, migrate, or resume on arbitrary machines, this is a
-fatal limitation.
+Storage paths that maintain guest-host session state require additional
+coordination among the runtime, VMM, and host-side storage service during
+snapshot and restore. Cross-host restoration also requires the destination
+to access the immutable base image and the sandbox's writable state.
+
+Block-image services are stateless, and independent of the original
+host. This can greatly simplify storage-side cloning, migration, and
+cross-host restoration.
 
 ### Security
 
@@ -91,7 +92,10 @@ instances amplify every inefficiency:
 - **O(n) lookup cost with layer depth.** overlayfs resolves each file
   access (open, stat, readdir, etc.) by searching
   every layer's directory tree top-down — O(n) in
-  the number of layers. qcow2's native internal snapshots avoid this
+  the number of layers. EROFS is a single-layer read-only filesystem,
+  so a multi-layer image built from EROFS must stack mounts with
+  overlayfs and inherits the same O(n) walk. qcow2's native internal
+  snapshots avoid this
   (all data lives in one file), but to conform to the layered-image
   model that container ecosystems expect (one image file per layer,
   shared and composable), operators must instead chain separate qcow2
@@ -127,13 +131,17 @@ instances amplify every inefficiency:
   five or more round-trips, each paying virtio notification and context-
   switch latency. The operations themselves are cheap; the cost is doing
   them one-at-a-time across a VM boundary instead of in-batch locally.
+  RAFS served through nydusd over FUSE or virtiofs incurs the same
+  per-operation round-trips.
 
 - **Copy-on-write penalty (overlayfs, qcow2).** The first modification
   to data residing in a lower layer triggers a full copy before the
   write can proceed — overlayfs copies the entire file to the upper
-  layer; qcow2 allocates a new cluster and copies the original content.
+  layer; qcow2 allocates a new cluster and copies the original content;
+  and EROFS, being read-only, places writes in an overlayfs upper layer
+  and incurs the same file-level copy-up.
   Agents frequently edit existing files (source code, configs), so this
-  is a recurring cost proportional to file/cluster size, not write size.
+  is a recurring cost: the copy plus the write itself.
 
 ## How Overlaybd Meets Each Need
 
@@ -174,13 +182,12 @@ perimeter.
 - **O(1) cross-layer lookup.** At image load time, overlaybd merges the
   indices of all layers into a single unified LSMT index. Runtime block
   lookup is constant-time regardless of layer count — a linearized B+
-  tree with AVX-512 SIMD acceleration sustains over 100 million IOPS for
-  metadata resolution.
+  tree with AVX-512 SIMD acceleration sustains hundreds of millions of
+  QPS for metadata resolution.
 
 - **Compact, memory-resident index.** In Alibaba's production
   environment, images larger than 50 GB have an average index under
-  300 KB — roughly 40× smaller than qcow2's ~12.5 MB L1/L2 table for a
-  comparable image. Even thousands of concurrent VMs keep their indices
+  300 KB. Even thousands of concurrent VMs keep their indices
   fully memory-resident with no eviction.
 
 - **On-demand fetching with seekable compression.** Only accessed blocks
@@ -252,13 +259,23 @@ greater scale, demonstrating maturity and reliability:
   also adopted Databricks' infrastructure to build a 200K QPS inference
   platform.
 
-- **Peer-reviewed research.** The DADI system
-  ([USENIX ATC '20](https://www.usenix.org/conference/atc20/presentation/li-huiba))
-  and FaaSNet
-  ([USENIX ATC '21](https://www.usenix.org/conference/atc21/presentation/wang-ao))
+- **Peer-reviewed research.** The
+  [DADI system](https://www.usenix.org/conference/atc20/presentation/li-huiba) and
+  [FaaSNet](https://www.usenix.org/conference/atc21/presentation/wang-ao)
   validate the architecture under rigorous academic review.
 
 ## Conclusion
+
+How the mainstream image stacks compare on these four requirements:
+
+| Image stack | Multi-OS support | VM snapshot & restore | Security | Efficiency |
+| --- | --- | --- | --- | --- |
+| OCI tar+gzip (overlayfs) | ✗ Linux only | ✗ overlay-mount state cannot be atomically captured or restored | ✗ serving the guest requires virtio-fs; known [virtio-fs security vulnerabilities](https://github.com/kata-containers/kata-containers/issues/12203) | ✗ full download and unpack; O(n) layer walk; copy-up |
+| eStargz / SOCI | ✗ Linux only | ✗ overlay-mount and FUSE session state | ✗ FUSE snapshotter; serving the guest requires virtio-fs with the same [security vulnerabilities](https://github.com/kata-containers/kata-containers/issues/12203) | ~ lazy pull, but stacking and copy-up remain |
+| qcow2 | ✓ Linux, Windows, Android, macOS alike | ✓ stateless device; sync and restore anywhere | ✓ strong isolation with thin interface | ✗ O(n) backing chains; L2 cache trades memory against I/O; cluster CoW |
+| EROFS | ✗ Linux kernel feature | ✗ layered via overlayfs; same mount-state problem | ✗ serving the guest requires virtio-fs; known [virtio-fs security vulnerabilities](https://github.com/kata-containers/kata-containers/issues/12203) | ✗ full image required; read-only, stacks via overlayfs |
+| Nydus (RAFS) | ✗ assumes a Linux fs stack | ✗ FUSE session and cache state live in nydusd | ✗ userspace daemon (nydusd); known [virtio-fs security vulnerabilities](https://github.com/kata-containers/kata-containers/issues/12203) | ~ lazy chunks, but per-operation FUSE/virtio-fs round-trips |
+| **overlaybd** | ✓ Linux, Windows, Android, macOS alike | ✓ stateless device; sync and restore anywhere | ✓ strong isolation with thin interface | ✓ on-demand fetch; O(1) lookup; small memory footprint; no copy-up |
 
 Agent sandboxes need to start fast, isolate untrusted code, fork cheaply,
 scale to thousands of instances, and support diverse operating systems.
